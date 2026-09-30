@@ -43,25 +43,30 @@ class SharedRounds:
         return got
 
     def _draw_streams(self, logits: Any, streams: list[tuple[Any, list[int]]]) -> Any:
-        """Draw consecutive stream rows using model sampling when available, otherwise GPU sampling with each row's own settings."""
+        """Draw consecutive stream rows using model sampling when available, otherwise GPU sampling with each row's own
+        settings. ``streams`` is ``[(stream, positions)]``. A stream that asks for a repetition / frequency / presence
+        penalty draws through the CPU exact path (``_draw`` with its own history), which forces the per-stream path for
+        the whole round; the GPU kernel keeps the batched fast path when no stream has a penalty."""
 
         import mlx.core as mx
 
         from tensorfold.engine.gpu_sampling import sample_rows
 
+        penalised = any(getattr(stream.sampling, "has_penalty", False) for stream, _ in streams)
         own = getattr(self.model, "sample_streams", None)
-        if callable(own) or callable(getattr(self.model, "sample", None)):
+        if penalised or callable(own) or callable(getattr(self.model, "sample", None)):
             parts, at = [], 0
             for _, positions in streams:
                 parts.append(logits[at:at + len(positions)])
                 at += len(positions)
-            if callable(own):
-                drawn = own(parts, [s for s, _ in streams], [p for _, p in streams])
+            if callable(own) and not penalised:
+                drawn = own(parts, [stream.sampling for stream, _ in streams], [p for _, p in streams])
             else:
-                drawn = [self._draw(x, s, p) for x, (s, p) in zip(parts, streams)]
+                drawn = [self._draw(x, stream.sampling, p, recent=self._recent(stream, len(p)))
+                         for x, (stream, p) in zip(parts, streams)]
             return mx.concatenate([t if isinstance(t, mx.array) else mx.array([int(v) for v in t], dtype=mx.uint32)
                                    for t in drawn])
-        samplings = [sampling for sampling, positions in streams for _ in positions]
+        samplings = [stream.sampling for stream, positions in streams for _ in positions]
         return sample_rows(logits, samplings, [p for _, positions in streams for p in positions])
 
     def _family_round_streams(self, entries: list[tuple[Any, list[Any]]]) -> dict[str, tuple[list[int], int, int]]:
@@ -97,7 +102,7 @@ class SharedRounds:
             logits = mx.concatenate([
                 plan[0].constraint.mask(logits[at:at + n], w) if w is not None else logits[at:at + n]
                 for plan, w, at, n in zip(plans, kept, offsets, lengths)])
-        parts = [self._draw_streams(logits, [(plan[0].sampling, at) for plan, at in zip(plans, positions)])]
+        parts = [self._draw_streams(logits, [(plan[0], at) for plan, at in zip(plans, positions)])]
         for plan in plans:
             if isinstance(plan[4], mx.array) and int(plan[4].shape[0]):
                 parts.append(plan[4].astype(parts[0].dtype))
