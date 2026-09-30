@@ -10,6 +10,8 @@ from tensorfold.server.tools import parse_tool_calls_from_content
 
 WRITE = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
     "path": {"type": "string"}, "content": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+GLOB = [{"type": "function", "function": {"name": "glob", "parameters": {"type": "object", "properties": {
+    "pattern": {"type": "string"}}}}}]
 
 
 def _args(call):
@@ -26,12 +28,24 @@ def test_unterminated_call_is_repaired_into_a_structured_call():
     assert args["path"] == "game.html" and args["content"].startswith("<!DOCTYPE html>")
 
 
-def test_a_terminated_block_is_left_to_normal_parsing():
-    # scope boundary: repair only touches UNTERMINATED blocks. A block that closed with <tool_call|> but has
-    # malformed args stays as text, matching the deliberate existing behaviour (a small malformed call is content).
-    reply = '<|tool_call>call:write{path:<|"|>a.html<|"|>,content:<|"|>x}|}{|}:{}<tool_call|>'
-    content, calls = parse_tool_calls_from_content(reply, WRITE)
-    assert calls is None and content == reply       # untouched: terminated, so out of repair scope
+def test_terminated_block_with_unbalanced_string_is_repaired():
+    # the observed glob leak: a terminated block whose pattern string opened with <|"|> but never closed (odd count)
+    reply = '<|tool_call>call:glob{pattern:<|"|>*/}<tool_call|>'
+    content, calls = parse_tool_calls_from_content(reply, GLOB)
+    assert "<|tool_call>" not in content and content == ""
+    assert calls and calls[0]["function"]["name"] == "glob" and _args(calls[0])["pattern"] == "*/"
+
+
+def test_text_after_a_repaired_terminated_block_is_kept():
+    reply = 'Found it.\n<|tool_call>call:glob{pattern:<|"|>*/}<tool_call|>\nok'
+    content, calls = parse_tool_calls_from_content(reply, GLOB)
+    assert content == "Found it.\n\nok" and calls[0]["function"]["name"] == "glob"
+
+
+def test_terminated_block_with_balanced_delimiters_stays_as_text():
+    # 0 (or any even count of) <|"|> and still malformed -> left as text, matching upstream's deliberate behaviour
+    reply = "<|tool_call>call:write{path}<tool_call|>"       # a bare key, no value, no string delimiters
+    assert parse_tool_calls_from_content(reply, WRITE) == (reply, None)
 
 
 def test_text_before_the_broken_call_is_kept():

@@ -353,7 +353,10 @@ def _repair_gemma_call(fragment: str, known: dict[str, str]) -> tuple[str, dict[
     head = _GEMMA_REPAIR_HEAD_RE.match(fragment)
     if head is None or head.group(1).lower() not in known:
         return None
-    name, body = head.group(1), head.group(2).split("<tool_call|>", 1)[0]     # drop a closer if the block had one
+    name = head.group(1)
+    body = head.group(2).split("<tool_call|>", 1)[0].rstrip()                 # drop a closer if the block had one
+    if body.endswith("}"):
+        body = body[:-1]                          # the arguments object's own close brace, not part of a value
     args: dict[str, Any] = {}
     i, n = 0, len(body)
     while i < n:
@@ -392,12 +395,14 @@ def _repair_gemma_call(fragment: str, known: dict[str, str]) -> tuple[str, dict[
 
 
 def _repair_leaked_tool_calls(content: str, known: dict[str, str]) -> tuple[str, list[dict[str, Any]]]:
-    """Repair or hide an *unterminated* Gemma tool-call block — one the reply opened with ``<|tool_call>`` but never
-    closed with ``<tool_call|>`` because it ran out of tokens mid-arguments — so its raw markup never reaches the reply
-    text. A call-shaped block for an offered tool becomes a structured call (a truncated final string is salvaged); a
-    call-shaped block for an unoffered tool is dropped; text that merely mentions the marker is left untouched. A
-    *terminated* block is left exactly as normal parsing left it (a small malformed call staying as text is deliberate,
-    per parse_tool_calls_from_content)."""
+    """Repair or hide a Gemma tool-call block whose markup survived normal parsing, so raw ``<|tool_call>`` never
+    reaches the reply text. A block is broken when it is *unterminated* (opened with ``<|tool_call>`` but cut off
+    before ``<tool_call|>`` at the token limit) or has an *unbalanced* ``<|"|>`` string delimiter (an odd count — the
+    model opened a string value and never closed it). A broken block for an offered tool becomes a structured call
+    (a truncated final string is salvaged), a broken block for an unoffered tool is hidden, and everything else — a
+    terminated block with balanced delimiters (a small malformed call that stays as text is deliberate upstream
+    behaviour) and text that merely mentions the marker — is left exactly as it was. Text after a terminated block is
+    kept."""
 
     opener, closer = "<|tool_call>", "<tool_call|>"
     calls: list[dict[str, Any]] = []
@@ -408,19 +413,23 @@ def _repair_leaked_tool_calls(content: str, known: dict[str, str]) -> tuple[str,
         if start < 0:
             out.append(content[pos:])
             break
-        nxt = content.find(opener, start + len(opener))
-        end = nxt if nxt >= 0 else len(content)
-        fragment = content[start + len(opener):end]
-        if closer in fragment:                                  # a terminated block: leave it exactly as it was
-            out.append(content[pos:end])
-        elif (repaired := _repair_gemma_call(fragment, known)) is not None:
-            calls.append(_openai_tool_call(repaired[0], repaired[1], known))
-            out.append(content[pos:start])                      # repaired into a call: drop the markup
-        elif _GEMMA_REPAIR_HEAD_RE.match(fragment) is not None:
-            out.append(content[pos:start])                      # a broken call to an unoffered tool: hide the markup
-        else:
-            out.append(content[pos:end])                        # not call-shaped: leave the text as written
-        pos = end
+        out.append(content[pos:start])                          # text before the block is always kept
+        body_at = start + len(opener)
+        close_at = content.find(closer, body_at)
+        nxt = content.find(opener, body_at)
+        terminated = close_at >= 0 and (nxt < 0 or close_at < nxt)
+        inner_end = close_at if terminated else (nxt if nxt >= 0 else len(content))
+        block_end = close_at + len(closer) if terminated else inner_end
+        inner = content[body_at:inner_end]
+        broken = (not terminated) or inner.count('<|"|>') % 2 == 1     # unterminated, or an unbalanced string value
+        if not broken:
+            out.append(content[start:block_end])                # terminated & balanced: leave as text (unchanged)
+        elif (repaired := _repair_gemma_call(inner, known)) is not None:
+            calls.append(_openai_tool_call(repaired[0], repaired[1], known))   # repaired: markup dropped
+        elif _GEMMA_REPAIR_HEAD_RE.match(inner) is None:
+            out.append(content[start:block_end])                # not call-shaped: leave the text as written
+        # else: a broken call to an unoffered tool -> hidden (nothing appended for the block)
+        pos = block_end
     return "".join(out).strip(), calls
 
 
