@@ -192,7 +192,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 # Preserve raw sampling and scheduling options; an absent temperature differs from temperature zero.
                 sampling_fields = {k: body[k] for k in ("temperature", "top_p", "top_k", "min_p", "seed", "priority",
                                                         "draft", "thinking_budget", "ignore_eos", "stop",
-                                                        *grammar.FIELDS)
+                                                        "repetition_penalty", "frequency_penalty", "presence_penalty",
+                                                        "penalty_last_n", *grammar.FIELDS)
                                    if k in body}
                 problem = grammar.refusal(body, app)        # compiled before a stream's headers: a bad grammar is a 400
                 if problem:
