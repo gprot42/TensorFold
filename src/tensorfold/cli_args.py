@@ -46,6 +46,15 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     generation.add_argument("--min-p", type=float, default=None,
                             help="keep tokens at least this share of the likeliest one's probability (default: the "
                                  "model's generation config, else 0: off)")
+    generation.add_argument("--repetition-penalty", type=float, default=None,
+                            help="discourage repeating a token already in the reply: >1 divides its positive logit / "
+                                 "multiplies its negative one (default: the model's generation config, else 1: off)")
+    generation.add_argument("--frequency-penalty", type=float, default=None,
+                            help="subtract this times how many times a token has appeared in the reply (default: 0: off)")
+    generation.add_argument("--presence-penalty", type=float, default=None,
+                            help="subtract this once for any token already in the reply (default: 0: off)")
+    generation.add_argument("--penalty-last-n", type=int, default=None,
+                            help="only the last N reply tokens count toward the penalties (default: 0: the whole reply)")
     generation.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True,
                             help="open a think block when the chat template supports it")
     generation.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"), default=None,

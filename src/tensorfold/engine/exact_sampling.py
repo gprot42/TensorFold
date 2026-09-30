@@ -21,15 +21,27 @@ class Sampling:
     top_k: int = 20
     top_p: float = 0.95
     min_p: float = 0.0          # keep tokens at least min_p times as likely as the likeliest (after temperature)
+    # Penalties on tokens already in the reply, applied to raw logits before top_k/top_p (all no-ops at the defaults):
+    repetition_penalty: float = 1.0   # >1 divides a seen token's positive logit / multiplies a negative one (HF rule)
+    frequency_penalty: float = 0.0    # subtract this * how many times the token has appeared
+    presence_penalty: float = 0.0     # subtract this once if the token has appeared at all
+    penalty_last_n: int = 0           # only the last N tokens count (0: the whole reply so far)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "top_k", max(0, int(self.top_k)))
+        object.__setattr__(self, "penalty_last_n", max(0, int(self.penalty_last_n)))
 
     @property
     def min_log(self) -> float:
         """ln(min_p), -inf when off: every rule adds it to the row's top scaled logit, one float64 add."""
 
         return math.log(self.min_p) if self.min_p > 0.0 else -math.inf
+
+    @property
+    def has_penalty(self) -> bool:
+        """Whether any repetition/frequency/presence penalty is active (else the recent-token history is ignored)."""
+
+        return self.repetition_penalty != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
 
 
 def seed_for(tokens: Sequence[int], salt: int = 0) -> int:
@@ -67,9 +79,36 @@ def uniform_rows(seed: int, positions: np.ndarray, ids: np.ndarray) -> np.ndarra
     return (x >> np.uint64(11)).astype(np.float64) * 2.0 ** -53 + 2.0 ** -54
 
 
-def choose(values: np.ndarray, ids: np.ndarray, position: int, s: Sampling) -> int:
+def penalized(values: np.ndarray, ids: np.ndarray, recent: Sequence[int] | None, s: Sampling) -> np.ndarray:
+    """Candidate ``values`` (the logits for ``ids``) with the repetition / frequency / presence penalties applied for
+    the tokens already in the reply (``recent``). Returns ``values`` unchanged when no penalty is active or ``recent``
+    is empty. The penalty is applied to the raw logits, before the top_k / top_p / min_p / Gumbel rule, so a
+    much-repeated token is pushed down among the candidates."""
+
+    if recent is None or not s.has_penalty:
+        return values
+    window = recent[-s.penalty_last_n:] if s.penalty_last_n else recent
+    if len(window) == 0:
+        return values
+    counts: dict[int, int] = {}
+    for token in window:
+        counts[int(token)] = counts.get(int(token), 0) + 1
+    seen = np.array([counts.get(int(i), 0) for i in ids], dtype=np.float64)
+    out = values.astype(np.float64).copy()
+    if s.repetition_penalty != 1.0:
+        hit = seen > 0
+        out[hit & (out > 0)] /= s.repetition_penalty
+        out[hit & (out <= 0)] *= s.repetition_penalty
+    if s.frequency_penalty != 0.0 or s.presence_penalty != 0.0:
+        out -= s.frequency_penalty * seen + s.presence_penalty * (seen > 0)
+    return out
+
+
+def choose(values: np.ndarray, ids: np.ndarray, position: int, s: Sampling,
+           recent: Sequence[int] | None = None) -> int:
     """One row: candidate logits ``values`` for token ``ids`` -> the sampled token id."""
 
+    values = penalized(values, ids, recent, s)
     order = np.lexsort((ids, -values))
     k = max(1, min(int(s.top_k) if s.top_k else len(ids), len(ids)))
     ids = ids[order][:k]
@@ -86,10 +125,14 @@ def choose(values: np.ndarray, ids: np.ndarray, position: int, s: Sampling) -> i
     return int(ids[int(np.argmax(scaled + gumbel))])
 
 
-def choose_rows(values: np.ndarray, ids: np.ndarray, positions: Sequence[int], s: Sampling) -> list[int]:
-    """Choose each row with the same operation order and bits as an independent ``choose`` call."""
+def choose_rows(values: np.ndarray, ids: np.ndarray, positions: Sequence[int], s: Sampling,
+                recent: Sequence[Sequence[int]] | None = None) -> list[int]:
+    """Choose each row with the same operation order and bits as an independent ``choose`` call. ``recent`` gives each
+    row's reply-so-far tokens for the penalties (row r uses ``recent[r]``); None applies no penalty."""
 
     rows, width = ids.shape
+    if recent is not None and s.has_penalty:
+        values = np.stack([penalized(values[r], ids[r], recent[r], s) for r in range(rows)])
     order = np.lexsort((ids, -values), axis=-1)
     k = max(1, min(int(s.top_k) if s.top_k else width, width))
     ids = np.take_along_axis(ids, order, axis=-1)[:, :k]
@@ -120,12 +163,13 @@ def top_candidates(logits: Any, s: Sampling) -> tuple[Any, Any] | None:
 
 
 def sample_rows(logits: Any, positions: Sequence[int], s: Sampling, keep: dict | None = None,
-                top: tuple[Any, Any] | None = None) -> list[int]:
-    """Sample logits [W, V] at absolute positions, optionally recording candidates in ``keep`` or reusing evaluated ``top``."""
+                top: tuple[Any, Any] | None = None, recent: Sequence[Sequence[int]] | None = None) -> list[int]:
+    """Sample logits [W, V] at absolute positions, optionally recording candidates in ``keep`` or reusing evaluated
+    ``top``. ``recent`` gives each row's reply-so-far tokens for the penalties (None: no penalty)."""
 
     import mlx.core as mx
 
-    if not s.top_k and 0.0 < s.top_p < 1.0 and top is None and keep is None:
+    if not s.top_k and 0.0 < s.top_p < 1.0 and top is None and keep is None and not s.has_penalty:
         drawn = _nucleus_rows(logits, positions, s)
         if drawn is not None:
             missing = [r for r, token in enumerate(drawn) if token is None]
@@ -151,7 +195,7 @@ def sample_rows(logits: Any, positions: Sequence[int], s: Sampling, keep: dict |
     cand_np, vals_np = np.array(cand), np.array(vals)
     if keep is not None:
         keep["cand"], keep["vals"] = cand_np, vals_np
-    return choose_rows(vals_np, cand_np.astype(np.int64), positions, s)
+    return choose_rows(vals_np, cand_np.astype(np.int64), positions, s, recent)
 
 
 def _nucleus_rows(logits: Any, positions: Sequence[int], s: Sampling) -> list[int | None] | None:
@@ -185,5 +229,5 @@ def _nucleus_rows(logits: Any, positions: Sequence[int], s: Sampling) -> list[in
     return out if any(token is not None for token in out) else None
 
 
-__all__ = ["MARGIN", "Sampling", "choose", "choose_rows", "sample_rows", "seed_for", "top_candidates", "uniform",
-           "uniform_rows"]
+__all__ = ["MARGIN", "Sampling", "choose", "choose_rows", "penalized", "sample_rows", "seed_for", "top_candidates",
+           "uniform", "uniform_rows"]

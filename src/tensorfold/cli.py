@@ -168,7 +168,9 @@ def cmd_info(args: argparse.Namespace) -> int:
 def _generation_config(model_dir: Path) -> dict[str, Any]:
     path = Path(model_dir) / "generation_config.json"
     config = json.loads(path.read_text()) if path.exists() else {}
-    sampling = {k: config[k] for k in ("temperature", "top_k", "top_p", "min_p") if config.get(k) is not None}
+    sampling = {k: config[k] for k in ("temperature", "top_k", "top_p", "min_p",
+                                       "repetition_penalty", "frequency_penalty", "presence_penalty")
+                if config.get(k) is not None}
     if config.get("do_sample") is False:
         sampling["temperature"] = 0.0
     elif config.get("do_sample") is True and "temperature" not in sampling:
@@ -279,7 +281,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
 
     sampling = _generation_config(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
-                       ("min_p", args.min_p)):
+                       ("min_p", args.min_p), ("repetition_penalty", args.repetition_penalty),
+                       ("frequency_penalty", args.frequency_penalty), ("presence_penalty", args.presence_penalty),
+                       ("penalty_last_n", args.penalty_last_n)):
         if value is not None:
             sampling[key] = value
     app_class = getattr(family.package, "CUDA_APP", None) or App
@@ -439,7 +443,9 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
                                        pass_cache=int(float(args.pass_cache_gib) * 1024**3))
     sampling = _generation_config(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
-                       ("min_p", args.min_p)):
+                       ("min_p", args.min_p), ("repetition_penalty", args.repetition_penalty),
+                       ("frequency_penalty", args.frequency_penalty), ("presence_penalty", args.presence_penalty),
+                       ("penalty_last_n", args.penalty_last_n)):
         if value is not None:
             sampling[key] = value
     snapshot_dir = None if str(args.snapshot_dir).lower() == "none" else Path(args.snapshot_dir).expanduser()
