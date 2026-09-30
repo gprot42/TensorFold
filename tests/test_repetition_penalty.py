@@ -103,3 +103,31 @@ def test_the_mac_app_resolves_penalties_into_the_draw():
     assert s.has_penalty
     # no penalty fields: a plain Sampling with the defaults (has_penalty False)
     assert not options._resolve_sampling({"seed": 4, "repetition_penalty": 1.0}, 0.7, [1, 2]).has_penalty
+
+
+def test_a_penalised_stream_is_opened_with_drafts_off_and_a_plain_one_keeps_them():
+    """The decode reroute: a penalty needs each row's history, which the Metal kernel does not carry, so the
+    stream the scheduler opens runs serial (no proposer, drafts off) and draws on the CPU exact path.
+    Guards the gate where upstream builds the stream (server/prompt_fill.py since 0.6.0): a rebase that
+    drops it still passes every other test while drafted rows skip the penalty."""
+
+    from tensorfold.engine.lane_engine import LaneStream
+    from tensorfold.server.scheduler import ChatJob, Scheduler
+    from tests.lane_fakes import FakeEngine
+
+    def opened(sampling: Sampling | None) -> LaneStream:
+        proposers: list[object] = []
+        scheduler = Scheduler(FakeEngine(), lanes=2, eos_ids=frozenset({-1}),
+                              proposer_factory=lambda: proposers.append(object()) or proposers[-1])
+        job = ChatJob("j", [5, 6, 7, 8], 4, 0.7, sampling=sampling)
+        scheduler._open_job(job)
+        while scheduler._fills:
+            scheduler._fill()
+        assert job.error is None and job.stream is not None
+        return job.stream
+
+    penalised = opened(Sampling(seed=1, temperature=0.7, repetition_penalty=1.3))
+    assert penalised.drafts is False and penalised.proposer is None
+    for sampling in (None, Sampling(seed=1, temperature=0.7)):
+        plain = opened(sampling)
+        assert plain.drafts is True and plain.proposer is not None
