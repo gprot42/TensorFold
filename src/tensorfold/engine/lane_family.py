@@ -62,11 +62,18 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         self._granted: dict[str, int] = {}           # stream id -> drafts its last shared round kept
         self._grammar_window: dict[str, Any] = {}    # stream id -> the window its grammar kept, masked at the draw
 
-    def _draw(self, logits: Any, sampling: Any, positions: Any) -> Any:
-        """Use the same model sampler or GPU sampler for every draw so streams match their own serial runs."""
+    def _draw(self, logits: Any, sampling: Any, positions: Any, recent: Any = None) -> Any:
+        """Use the same model sampler or GPU sampler for every draw so streams match their own serial runs. A stream
+        that asks for a repetition / frequency / presence penalty draws through the CPU exact path instead (the GPU
+        kernel does not carry per-row history); its stream runs serial (drafts off) so ``recent`` is exact per row."""
 
         import mlx.core as mx
 
+        if sampling is not None and getattr(sampling, "has_penalty", False):
+            from tensorfold.engine.exact_sampling import sample_rows as cpu_sample_rows
+
+            drawn = cpu_sample_rows(logits, list(positions), sampling, recent=recent)
+            return mx.array([int(t) for t in drawn], dtype=mx.uint32)
         from tensorfold.engine.gpu_sampling import sample as gpu_sample
 
         own = getattr(self.model, "sample", None)
@@ -74,6 +81,14 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
             out = own(logits, sampling, positions)
             return out if isinstance(out, mx.array) else mx.array([int(t) for t in out], dtype=mx.uint32)
         return gpu_sample(logits, sampling, positions)
+
+    def _recent(self, stream: Any, count: int) -> Any:
+        """Each of ``count`` rows' reply-so-far tokens for the penalties, or None when the stream has no penalty (the
+        penalised stream runs with drafts off, so one row a round and ``stream.emitted`` is that row's exact history)."""
+
+        if stream.sampling is None or not getattr(stream.sampling, "has_penalty", False):
+            return None
+        return [stream.emitted] * count
 
     def _family_step(self) -> dict[str, list[int]]:
         landed: dict[str, list[int]] = {}
@@ -364,7 +379,8 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         window = self._grammar_window.pop(stream.stream_id, None)
         if window is not None:                               # each row masked along its own path
             logits = stream.constraint.mask(logits, window)
-        tokens = self._draw(logits, stream.sampling, [position + 1 + d for d in depths])
+        tokens = self._draw(logits, stream.sampling, [position + 1 + d for d in depths],
+                            recent=self._recent(stream, len(depths)))
         speculate = (self.family_mtp and stream.drafts and kind != "forced" and self.speculate_early
                      and parents is None)
         parts = [tokens]

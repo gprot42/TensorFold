@@ -148,7 +148,7 @@ class FamilyPrefill:
         logits = self.model.head(hidden)
         if stream.constraint is not None:                # the first token under the reply's grammar
             logits = stream.constraint.mask(logits)
-        token = self._draw(logits, stream.sampling, [prompt_len])
+        token = self._draw(logits, stream.sampling, [prompt_len], recent=self._recent(stream, 1))
         forced = self._forced_next(stream, token)
         if forced is not None:
             token = mx.array([forced], dtype=mx.uint32)
@@ -174,7 +174,7 @@ class FamilyPrefill:
 
         hidden = self.model.hidden(token.reshape(1, 1), cache)
         stream.cache_len += 1
-        nxt = self._draw(self.model.head(hidden), stream.sampling, [stream.cache_len])
+        nxt = self._draw(self.model.head(hidden), stream.sampling, [stream.cache_len], recent=self._recent(stream, 1))
         mx.async_eval(nxt)
         self._inflight[stream.stream_id] = nxt
 

@@ -527,14 +527,17 @@ class Scheduler(PromptFill):
             proposer = job.proposer
             if proposer is None and job.drafts and self.proposer_factory is not None:
                 proposer = self.proposer_factory()
+            # A repetition / frequency / presence penalty needs each row's history, which the GPU kernel does not
+            # carry; the stream runs serial (drafts off) so it draws through the CPU exact path one row a round.
+            use_drafts = bool(job.drafts) and not (job.sampling is not None and job.sampling.has_penalty)
             stream = LaneStream(
                 stream_id=job.job_id,
                 prompt_ids=list(job.prompt_ids),
                 max_new_tokens=int(job.max_tokens),
                 eos_ids=frozenset() if job.ignore_eos else self.eos_ids,
                 stop_check=job.stop_check,
-                proposer=proposer if job.drafts else None,
-                drafts=bool(job.drafts),
+                proposer=proposer if use_drafts else None,
+                drafts=use_drafts,
                 sampling=job.sampling,
                 think_budget=int(job.think_budget),
                 think_close=tuple(job.think_close),
