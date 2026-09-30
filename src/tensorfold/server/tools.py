@@ -391,18 +391,17 @@ def _repair_gemma_call(fragment: str, known: dict[str, str]) -> tuple[str, dict[
                 args[field] = json.loads(token)
             except (ValueError, TypeError):
                 args[field] = token
-    return name, args
+    return (name, args) if args else None    # nothing salvageable (e.g. a bare `{keyword}`): not a repairable call
 
 
 def _repair_leaked_tool_calls(content: str, known: dict[str, str]) -> tuple[str, list[dict[str, Any]]]:
     """Repair or hide a Gemma tool-call block whose markup survived normal parsing, so raw ``<|tool_call>`` never
-    reaches the reply text. A block is broken when it is *unterminated* (opened with ``<|tool_call>`` but cut off
-    before ``<tool_call|>`` at the token limit) or has an *unbalanced* ``<|"|>`` string delimiter (an odd count — the
-    model opened a string value and never closed it). A broken block for an offered tool becomes a structured call
-    (a truncated final string is salvaged), a broken block for an unoffered tool is hidden, and everything else — a
-    terminated block with balanced delimiters (a small malformed call that stays as text is deliberate upstream
-    behaviour) and text that merely mentions the marker — is left exactly as it was. Text after a terminated block is
-    kept."""
+    reaches the reply text. Every block here already failed the strict parse (unterminated at the token limit, an
+    unbalanced ``<|"|>`` string, or a degenerate value the model emitted un-delimited). When the block's arguments can
+    be salvaged for an offered tool (at least one field) it becomes a structured call; an *unterminated* call that
+    cannot be salvaged is hidden (it was cut off, so its text is useless); a *terminated* block that cannot be salvaged
+    is left as text (a small malformed call such as a bare ``{location}`` staying as text is deliberate upstream
+    behaviour), as is text that merely mentions the marker. Text after a terminated block is kept."""
 
     opener, closer = "<|tool_call>", "<tool_call|>"
     calls: list[dict[str, Any]] = []
@@ -421,14 +420,13 @@ def _repair_leaked_tool_calls(content: str, known: dict[str, str]) -> tuple[str,
         inner_end = close_at if terminated else (nxt if nxt >= 0 else len(content))
         block_end = close_at + len(closer) if terminated else inner_end
         inner = content[body_at:inner_end]
-        broken = (not terminated) or inner.count('<|"|>') % 2 == 1     # unterminated, or an unbalanced string value
-        if not broken:
-            out.append(content[start:block_end])                # terminated & balanced: leave as text (unchanged)
-        elif (repaired := _repair_gemma_call(inner, known)) is not None:
-            calls.append(_openai_tool_call(repaired[0], repaired[1], known))   # repaired: markup dropped
-        elif _GEMMA_REPAIR_HEAD_RE.match(inner) is None:
-            out.append(content[start:block_end])                # not call-shaped: leave the text as written
-        # else: a broken call to an unoffered tool -> hidden (nothing appended for the block)
+        repaired = _repair_gemma_call(inner, known)
+        if repaired is not None:
+            calls.append(_openai_tool_call(repaired[0], repaired[1], known))   # salvaged >=1 arg: drop the markup
+        elif not terminated and _GEMMA_REPAIR_HEAD_RE.match(inner) is not None:
+            pass                                                # a cut-off call we can't salvage: hide the markup
+        else:
+            out.append(content[start:block_end])                # terminated-unrepairable, or plain text: leave as-is
         pos = block_end
     return "".join(out).strip(), calls
 

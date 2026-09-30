@@ -9,7 +9,8 @@ import json
 from tensorfold.server.tools import parse_tool_calls_from_content
 
 WRITE = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
-    "path": {"type": "string"}, "content": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+    "path": {"type": "string"}, "content": {"type": "string"}, "limit": {"type": "integer"},
+    "filePath": {"type": "string"}}}}}]
 GLOB = [{"type": "function", "function": {"name": "glob", "parameters": {"type": "object", "properties": {
     "pattern": {"type": "string"}}}}}]
 
@@ -42,10 +43,20 @@ def test_text_after_a_repaired_terminated_block_is_kept():
     assert content == "Found it.\n\nok" and calls[0]["function"]["name"] == "glob"
 
 
-def test_terminated_block_with_balanced_delimiters_stays_as_text():
-    # 0 (or any even count of) <|"|> and still malformed -> left as text, matching upstream's deliberate behaviour
-    reply = "<|tool_call>call:write{path}<tool_call|>"       # a bare key, no value, no string delimiters
+def test_terminated_block_with_a_bare_keyword_stays_as_text():
+    # a bare key, no value, no salvageable args -> left as text, matching upstream's deliberate behaviour
+    reply = "<|tool_call>call:write{path}<tool_call|>"
     assert parse_tool_calls_from_content(reply, WRITE) == (reply, None)
+
+
+def test_terminated_balanced_but_degenerate_value_is_repaired():
+    # balanced <|"|> (even), but the model emitted a value as a bare degenerate token instead of a <|"|> string
+    reply = '<|tool_call>call:write{content:<|"|>const x = 1;<|"|>,filePath:mapsto_path_now}<tool_call|>'
+    content, calls = parse_tool_calls_from_content(reply, WRITE)
+    assert "<|tool_call>" not in content and content == ""
+    args = _args(calls[0])
+    assert calls[0]["function"]["name"] == "write"
+    assert args["content"] == "const x = 1;" and args["filePath"] == "mapsto_path_now"
 
 
 def test_text_before_the_broken_call_is_kept():
