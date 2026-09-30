@@ -10,13 +10,14 @@ from tensorfold.server.errors import RequestError
 from tensorfold.server.stopping import stop_options
 
 
-_INTEGER_FIELDS = {"seed", "top_k", "thinking_budget", "max_tokens", "max_completion_tokens"}
+_INTEGER_FIELDS = {"seed", "top_k", "thinking_budget", "max_tokens", "max_completion_tokens", "penalty_last_n"}
 
 
 def parse_numbers(fields: dict[str, Any]) -> dict[str, Any]:
     stop_options(fields)
     parsed = dict(fields)
-    for name in (*sorted(_INTEGER_FIELDS), "temperature", "top_p", "min_p"):
+    for name in (*sorted(_INTEGER_FIELDS), "temperature", "top_p", "min_p",
+                 "repetition_penalty", "frequency_penalty", "presence_penalty"):
         value = fields.get(name)
         if value is None:
             continue
@@ -34,6 +35,8 @@ def parse_numbers(fields: dict[str, Any]) -> dict[str, Any]:
             raise RequestError(f"{name} must be {kind} or null") from exc
         if name == "min_p" and not 0.0 <= number <= 1.0:
             raise RequestError("min_p must be between 0 and 1, or null")
+        if name == "repetition_penalty" and number <= 0.0:
+            raise RequestError("repetition_penalty must be greater than 0, or null")
         parsed[name] = max(0, number) if name == "top_k" else number
     return parsed
 
@@ -97,7 +100,11 @@ class RequestOptions:
             return None
         return Sampling(seed=options.get("seed", seed_for(prompt_ids)), temperature=temp,
                         top_k=options.get("top_k", 0), top_p=options.get("top_p", 1.0),
-                        min_p=options.get("min_p", 0.0))
+                        min_p=options.get("min_p", 0.0),
+                        repetition_penalty=options.get("repetition_penalty", 1.0),
+                        frequency_penalty=options.get("frequency_penalty", 0.0),
+                        presence_penalty=options.get("presence_penalty", 0.0),
+                        penalty_last_n=options.get("penalty_last_n", 0))
 
     def _call_gate(self, fields: dict[str, Any], prompt_ids: list[int], tools: Any) -> Any:
         """The gate that opens a required tool call (``tool_choice`` "required" or a named function), else None."""

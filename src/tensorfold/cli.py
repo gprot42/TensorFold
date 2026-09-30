@@ -52,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     generation.add_argument("--min-p", type=float, default=None,
                             help="keep tokens at least this share of the likeliest one's probability (default: the "
                                  "model's generation config, else 0: off)")
+    generation.add_argument("--repetition-penalty", type=float, default=None,
+                            help="discourage repeating a token already in the reply: >1 divides its positive logit / "
+                                 "multiplies its negative one (default: the model's generation config, else 1: off)")
+    generation.add_argument("--frequency-penalty", type=float, default=None,
+                            help="subtract this times how many times a token has appeared in the reply (default: 0: off)")
+    generation.add_argument("--presence-penalty", type=float, default=None,
+                            help="subtract this once for any token already in the reply (default: 0: off)")
+    generation.add_argument("--penalty-last-n", type=int, default=None,
+                            help="only the last N reply tokens count toward the penalties (default: 0: the whole reply)")
     generation.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True,
                             help="open a think block when the chat template supports it")
     generation.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default=None,
@@ -277,7 +286,8 @@ def cmd_info(args: argparse.Namespace) -> int:
 def _generation_config(model_dir: Path) -> dict[str, Any]:
     path = Path(model_dir) / "generation_config.json"
     config = json.loads(path.read_text()) if path.exists() else {}
-    sampling = {k: config[k] for k in ("temperature", "top_k", "top_p", "min_p") if k in config}
+    sampling = {k: config[k] for k in ("temperature", "top_k", "top_p", "min_p",
+                                       "repetition_penalty", "frequency_penalty", "presence_penalty") if k in config}
     if config.get("do_sample") is False:
         sampling["temperature"] = 0.0
     elif config.get("do_sample") is True and "temperature" not in sampling:
@@ -376,7 +386,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
 
     sampling = _generation_config(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
-                       ("min_p", args.min_p)):
+                       ("min_p", args.min_p), ("repetition_penalty", args.repetition_penalty),
+                       ("frequency_penalty", args.frequency_penalty), ("presence_penalty", args.presence_penalty),
+                       ("penalty_last_n", args.penalty_last_n)):
         if value is not None:
             sampling[key] = value
     app_class = getattr(family.package, "CUDA_APP", None) or App
@@ -532,7 +544,9 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     engine_factory = functools.partial(LaneEngine, prefill_plan=plan)      # every family decodes through lanes
     sampling = _generation_config(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k),
-                       ("min_p", args.min_p)):
+                       ("min_p", args.min_p), ("repetition_penalty", args.repetition_penalty),
+                       ("frequency_penalty", args.frequency_penalty), ("presence_penalty", args.presence_penalty),
+                       ("penalty_last_n", args.penalty_last_n)):
         if value is not None:
             sampling[key] = value
     snapshot_dir = None if str(args.snapshot_dir).lower() == "none" else Path(args.snapshot_dir).expanduser()
