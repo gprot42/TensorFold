@@ -108,6 +108,8 @@ _GEMMA_TOOL_CALL_BLOCK_RE = re.compile(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>",
 _GEMMA_CALL_RE = re.compile(r"^call:([\w.-]+)\s*(\{.*\})$", re.DOTALL)
 _GEMMA_STRING_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
 _GEMMA_KEY_RE = re.compile(r"(?<=[{,])\s*([A-Za-z_][\w-]*)\s*:")
+# The head of a Gemma call, tolerant of a body that never closed: <|tool_call>[call]:NAME{... (no <tool_call|> / no })
+_GEMMA_REPAIR_HEAD_RE = re.compile(r"\s*(?:call)?:([\w.\-]+)\s*\{(.*)$", re.DOTALL)
 # DeepSeek-V4's DSML: one <｜DSML｜tool_calls> block holds invokes of named parameters, string="false" ones as JSON
 _DSML_BLOCK_RE = re.compile(r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>", re.DOTALL)
 _DSML_INVOKE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">(.*?)</｜DSML｜invoke>', re.DOTALL)
@@ -342,6 +344,86 @@ def _envelopes(text: str) -> list[tuple[int, int, str]]:
     return kept
 
 
+def _repair_gemma_call(fragment: str, known: dict[str, str]) -> tuple[str, dict[str, Any]] | None:
+    """Best-effort ``(name, arguments)`` from a Gemma ``call:NAME{...}`` fragment that did not parse cleanly — the
+    block ran past the token limit before ``<tool_call|>``, or its arguments were corrupted. Complete ``key:value``
+    pairs are kept and an unterminated final string value is salvaged to the end. Returns None when the fragment is
+    not call-shaped or names a tool that was not offered."""
+
+    head = _GEMMA_REPAIR_HEAD_RE.match(fragment)
+    if head is None or head.group(1).lower() not in known:
+        return None
+    name, body = head.group(1), head.group(2).split("<tool_call|>", 1)[0]     # drop a closer if the block had one
+    args: dict[str, Any] = {}
+    i, n = 0, len(body)
+    while i < n:
+        while i < n and body[i] in " ,\t\r\n":
+            i += 1
+        if i >= n or body[i] == "}":
+            break
+        key = re.match(r"([A-Za-z_][\w\-]*)\s*:", body[i:])
+        if key is None:
+            break
+        field = key.group(1)
+        i += key.end()
+        while i < n and body[i] in " \t\r\n":
+            i += 1
+        if body.startswith('<|"|>', i):                       # a string value
+            i += 5
+            close = body.find('<|"|>', i)
+            args[field], i = (body[i:close], close + 5) if close >= 0 else (body[i:], n)   # salvage if unterminated
+        else:                                                 # a bare token / number / nested value
+            depth, j = 0, i
+            while j < n:
+                char = body[j]
+                if char in "{[":
+                    depth += 1
+                elif char in "}]" and depth:
+                    depth -= 1
+                elif char in "}]" or (char == "," and depth == 0):
+                    break
+                j += 1
+            token, i = body[i:j].strip(), j
+            try:
+                args[field] = json.loads(token)
+            except (ValueError, TypeError):
+                args[field] = token
+    return name, args
+
+
+def _repair_leaked_tool_calls(content: str, known: dict[str, str]) -> tuple[str, list[dict[str, Any]]]:
+    """Repair or hide an *unterminated* Gemma tool-call block — one the reply opened with ``<|tool_call>`` but never
+    closed with ``<tool_call|>`` because it ran out of tokens mid-arguments — so its raw markup never reaches the reply
+    text. A call-shaped block for an offered tool becomes a structured call (a truncated final string is salvaged); a
+    call-shaped block for an unoffered tool is dropped; text that merely mentions the marker is left untouched. A
+    *terminated* block is left exactly as normal parsing left it (a small malformed call staying as text is deliberate,
+    per parse_tool_calls_from_content)."""
+
+    opener, closer = "<|tool_call>", "<tool_call|>"
+    calls: list[dict[str, Any]] = []
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = content.find(opener, pos)
+        if start < 0:
+            out.append(content[pos:])
+            break
+        nxt = content.find(opener, start + len(opener))
+        end = nxt if nxt >= 0 else len(content)
+        fragment = content[start + len(opener):end]
+        if closer in fragment:                                  # a terminated block: leave it exactly as it was
+            out.append(content[pos:end])
+        elif (repaired := _repair_gemma_call(fragment, known)) is not None:
+            calls.append(_openai_tool_call(repaired[0], repaired[1], known))
+            out.append(content[pos:start])                      # repaired into a call: drop the markup
+        elif _GEMMA_REPAIR_HEAD_RE.match(fragment) is not None:
+            out.append(content[pos:start])                      # a broken call to an unoffered tool: hide the markup
+        else:
+            out.append(content[pos:end])                        # not call-shaped: leave the text as written
+        pos = end
+    return "".join(out).strip(), calls
+
+
 def parse_tool_calls_from_content(
     text: str,
     tools: list[dict[str, Any]],
@@ -356,6 +438,10 @@ def parse_tool_calls_from_content(
         bare_calls = _parse_bare_json_tool_calls(text, known, max_calls=max_calls)
         if bare_calls is not None:
             return "", bare_calls
+        if max_calls is None and "<|tool_call>" in text:        # an unterminated block leaked no complete envelope
+            content, repaired = _repair_leaked_tool_calls(text, known)
+            if repaired or content != text.strip():
+                return content, repaired or None
         return text, None
     calls: list[dict[str, Any]] = []
     residue_parts: list[str] = []
@@ -383,6 +469,11 @@ def parse_tool_calls_from_content(
                 calls.append(_openai_tool_call(*one, known))
     residue_parts.append(text[cursor:])
     content = "".join(residue_parts).strip()
+    # Repair or hide a Gemma tool-call block that did not parse (unterminated at the token limit, or corrupted
+    # arguments) so its raw <|tool_call> markup never leaks into the reply. Only on the lenient reply path.
+    if max_calls is None and "<|tool_call>" in content:
+        content, repaired = _repair_leaked_tool_calls(content, known)
+        calls.extend(repaired)
     return content, calls or None
 
 
